@@ -147,3 +147,31 @@ class XPUFP8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     ) -> torch.Tensor:
         # Not reached — apply_weights is fully overridden.
         raise NotImplementedError
+
+
+class XPUW8A8TritonBlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
+    """XPU FP8 block-scaled kernel backed by Triton block-scaled op."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_xpu():
+            return False, "XPUW8A8TritonBlockScaledMM only supports XPU"
+        return True, None
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+            A,
+            B,
+            As,
+            Bs,
+            list(self.weight_group_shape),
+            self.config.out_dtype,
+        )

@@ -142,6 +142,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
 from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
     XPUFP8BlockScaledMMLinearKernel,
     XPUFP8ScaledMMLinearKernel,
+    XPUW8A8TritonBlockScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import PlatformEnum, current_platform
@@ -201,7 +202,11 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         TritonFp8BlockScaledMMKernel,
     ],
     PlatformEnum.XPU: [
+        # XPUFP8ScaledMMLinearKernel is a fallback as it dequantizes block-scaled FP8 weights
+        # to BF16 at load time and uses standard torch.nn.functional.linear for inference
         XPUFP8BlockScaledMMLinearKernel,
+        # TODO: XPUW8A8TritonBlockScaledMMLinearKernel is a block kernel that uses Triton, but compile error now.
+        XPUW8A8TritonBlockScaledMMLinearKernel,
     ],
 }
 
