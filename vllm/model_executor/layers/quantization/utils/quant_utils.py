@@ -381,6 +381,18 @@ def get_and_maybe_dequant_weights(
     ):
         return weight.to(out_dtype)
 
+    # The weight may have already been dequantized to a floating-point dtype
+    # by the selected kernel (e.g. XPUFP8BlockScaledMMLinearKernel converts
+    # FP8 block-scaled weights to BF16 at load time). In that case skip
+    # dequantization — the scale may have been cleared already.
+    _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+    if hasattr(torch, "float8_e4m3fnuz"):
+        _FP8_DTYPES.add(torch.float8_e4m3fnuz)
+    if weight.dtype not in _FP8_DTYPES and weight.dtype not in (
+        torch.int8, torch.uint8, torch.int32
+    ):
+        return weight.to(out_dtype)
+
     # Simple Fp8 case: rescale with tensor or block weight scales
     if (
         isinstance(layer.quant_method, Fp8LinearMethod)
