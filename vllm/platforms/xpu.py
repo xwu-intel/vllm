@@ -307,6 +307,10 @@ class XPUPlatform(Platform):
         return True
 
     @classmethod
+    def use_custom_op_collectives(cls) -> bool:
+        return True
+
+    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
