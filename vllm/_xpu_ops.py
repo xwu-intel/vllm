@@ -35,6 +35,17 @@ if hasattr(torch.ops._xpu_C, "fp8_gemm"):
         weight_scale: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if q_input.dim() == 3 and q_weight.dim() == 3:
+            N = (
+                q_weight.size(2)
+                if q_weight.size(1) == q_input.size(2)
+                else q_weight.size(1)
+            )
+            return torch.empty(
+                (q_input.size(0), q_input.size(1), N),
+                dtype=out_dtype,
+                device=q_input.device,
+            )
         input_2d = q_input.view(-1, q_input.shape[-1])
         M = input_2d.size(0)
         N = q_weight.size(1)
