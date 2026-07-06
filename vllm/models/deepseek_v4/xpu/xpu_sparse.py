@@ -95,15 +95,23 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
 
         hidden_dim = o_fp8.shape[-1]
         wo_a_raw_weight = cast(torch.Tensor, self.wo_a.weight)
-        wo_a_raw_scale = cast(torch.Tensor, self.wo_a.weight_scale_inv)
         wo_a_weight = torch.reshape(
             wo_a_raw_weight, (self.n_local_groups, self.o_lora_rank, hidden_dim)
         ).transpose(1, 2)
+
+        scale_attr = (
+            "weight_scale_inv"
+            if hasattr(self.wo_a, "weight_scale_inv")
+            else "weight_scale"
+        )
+        wo_a_raw_scale = cast(torch.Tensor, getattr(self.wo_a, scale_attr))
         wo_a_scale = (
-            torch.reshape(wo_a_raw_scale, (hidden_dim // 128, self.n_local_groups, -1))
-            .transpose(0, 1)
+            torch.reshape(wo_a_raw_scale, (self.n_local_groups, self.o_lora_rank, -1))
+            .transpose(1, 2)
             .contiguous()
         )
+        if wo_a_scale.dtype == torch.uint8:
+            wo_a_scale = wo_a_scale.view(torch.float8_e8m0fnu)
 
         z = torch.ops._xpu_C.fp8_gemm(
             o_fp8.transpose(0, 1),
