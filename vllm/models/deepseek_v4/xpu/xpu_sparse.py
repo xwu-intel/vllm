@@ -105,11 +105,40 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             else "weight_scale"
         )
         wo_a_raw_scale = cast(torch.Tensor, getattr(self.wo_a, scale_attr))
-        wo_a_scale = (
-            torch.reshape(wo_a_raw_scale, (self.n_local_groups, self.o_lora_rank, -1))
-            .transpose(1, 2)
-            .contiguous()
-        )
+        kernel_scale_cols = hidden_dim // 32
+        can_expand_2d_scale = False
+        rows_per_group = 0
+        scale_cols = 0
+        if wo_a_raw_scale.ndim == 2:
+            scale_rows, scale_cols = wo_a_raw_scale.shape
+            rows_per_group = scale_rows // self.n_local_groups
+            can_expand_2d_scale = (
+                scale_rows % self.n_local_groups == 0
+                and rows_per_group > 0
+                and self.o_lora_rank % rows_per_group == 0
+                and scale_cols > 0
+                and kernel_scale_cols % scale_cols == 0
+            )
+        if can_expand_2d_scale:
+            output_repeat = self.o_lora_rank // rows_per_group
+            input_repeat = kernel_scale_cols // scale_cols
+            wo_a_scale = torch.reshape(
+                wo_a_raw_scale,
+                (self.n_local_groups, rows_per_group, scale_cols),
+            )
+            if output_repeat != 1:
+                wo_a_scale = wo_a_scale.repeat_interleave(output_repeat, dim=1)
+            if input_repeat != 1:
+                wo_a_scale = wo_a_scale.repeat_interleave(input_repeat, dim=2)
+            wo_a_scale = wo_a_scale.transpose(1, 2).contiguous()
+        else:
+            wo_a_scale = (
+                torch.reshape(
+                    wo_a_raw_scale, (self.n_local_groups, self.o_lora_rank, -1)
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
         if wo_a_scale.dtype == torch.uint8:
             wo_a_scale = wo_a_scale.view(torch.float8_e8m0fnu)
 
