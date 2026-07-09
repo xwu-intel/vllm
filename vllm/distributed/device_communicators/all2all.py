@@ -18,7 +18,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_two_sided,
 )
 from vllm.utils.func_utils import supports_kw
-from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
+from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_deep_symm, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -1090,3 +1090,47 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             for _, handle in self.handle_cache._cache.items():
                 handle.destroy()
             self.handle_cache._cache.clear()
+
+
+class DeepSymmAll2AllManager(All2AllManagerBase):
+    """
+    TP-level allgather+remap / unpermute+reduce_scatter backed by
+    DeepSymm SymmBuffer. Used for sequence-parallel MoE on XPU.
+
+    Unlike EP all2all managers, this operates on the TP group for
+    fused allgather_local_permute and unpermute_reducescatter.
+    """
+
+    def __init__(self, cpu_group, tp_group, max_tokens_per_rank: int = 4096):
+        assert has_deep_symm(), (
+            "deep_symm package not found. Please install deep_symm."
+        )
+        super().__init__(cpu_group)
+        self._tp_group = tp_group
+        self._max_tokens_per_rank = max_tokens_per_rank
+        self._sbuf = None
+        self._symm_handle = None
+
+    def get_sbuf(self, hidden_size: int, num_topk: int):
+        if self._sbuf is None:
+            from deep_symm.moe_tp import SymmBuffer
+
+            self._sbuf = SymmBuffer(
+                group=self._tp_group,
+                num_max_tokens_per_rank=self._max_tokens_per_rank,
+                hidden=hidden_size,
+                num_topk=num_topk,
+            )
+        return self._sbuf
+
+    @property
+    def symm_handle(self):
+        return self._symm_handle
+
+    @symm_handle.setter
+    def symm_handle(self, value):
+        self._symm_handle = value
+
+    def destroy(self):
+        self._sbuf = None
+        self._symm_handle = None
