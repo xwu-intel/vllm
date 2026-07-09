@@ -126,6 +126,7 @@ def _moe_forward(
         router_logits,
         shared_experts_input,
         input_ids,
+        sp_local_input=(hidden_dim_unpadded == -1),
     )
 
 
@@ -288,6 +289,64 @@ class MoERunner(MoERunnerInterface):
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+        # Set by MoeSPFusionPass when compile-time SP removes the
+        # all_gather/reduce_scatter around moe_forward.
+        self._sp_local_last_call = False
+        # Modular kernel for SP path (DeepSymm PrepareFinalize +
+        # GroupedGemm Experts). Created lazily on first SP call.
+        self._sp_moe_kernel: "FusedMoEKernel | None" = None
+        self._sp_max_tokens_per_rank = 4096
+
+    def _create_sp_moe_kernel(self):
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.device_communicators.all2all import (
+            DeepSymmAll2AllManager,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEQuantConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.xpu_grouped_gemm_moe import (
+            XPUGroupedGemmExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEKernel,
+        )
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepsymm_sp import (
+            XPUDeepSymmPrepareFinalize,
+        )
+
+        tp_group = get_tp_group()
+        all2all_manager = DeepSymmAll2AllManager(
+            cpu_group=tp_group.cpu_group,
+            tp_group=tp_group.device_group,
+            max_tokens_per_rank=self._sp_max_tokens_per_rank,
+        )
+
+        prepare_finalize = XPUDeepSymmPrepareFinalize(
+            all2all_manager=all2all_manager,
+        )
+
+        # Get quant_config from existing moe_kernel if available,
+        # otherwise construct a minimal one for BF16.
+        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
+        if moe_kernel is not None:
+            existing_experts = moe_kernel.fused_experts
+            quant_config = existing_experts.quant_config
+            is_int4 = getattr(existing_experts, "is_int4", False)
+            is_mxfp4 = getattr(existing_experts, "is_mxfp4", False)
+        else:
+            quant_config = FusedMoEQuantConfig.make()
+            is_int4 = False
+            is_mxfp4 = False
+
+        experts = XPUGroupedGemmExperts(
+            moe_config=self.moe_config,
+            quant_config=quant_config,
+        )
+        experts.is_int4 = is_int4
+        experts.is_mxfp4 = is_mxfp4
+
+        return FusedMoEKernel(prepare_finalize, experts)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -481,6 +540,7 @@ class MoERunner(MoERunnerInterface):
         if (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
+            and not self._sp_local_last_call
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
@@ -600,13 +660,23 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            if self._sp_local_last_call:
+                if self._sp_moe_kernel is None:
+                    self._sp_moe_kernel = self._create_sp_moe_kernel()
+                fused_out = self.routed_experts.forward_sp(
+                    self._sp_moe_kernel,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -833,6 +903,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        sp_local_input: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -862,6 +933,13 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        # When compile-SP removed all_gather/reduce_scatter around this op,
+        # we receive a local TP chunk (signaled by sp_local_input=True via
+        # hidden_dim_unpadded=-1 sentinel in the compiled graph).
+        # Gate/router run on local chunk. The all_gather happens inside
+        # _apply_quant_method (after routing, before expert computation).
+        self._sp_local_last_call = sp_local_input
+
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
@@ -878,10 +956,12 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            return self._maybe_combine(
+            result = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+
+        return result
 
     #########################################################
     #
