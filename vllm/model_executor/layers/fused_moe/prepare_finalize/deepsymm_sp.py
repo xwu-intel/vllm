@@ -5,8 +5,8 @@ XPU DeepSymm Sequence-Parallel PrepareFinalize for MoE.
 
 When MoeSPFusionPass is active, the MoE runner receives a local TP chunk.
 This PrepareFinalize uses DeepSymm SymmBuffer fused kernels:
-  - prepare(): fused all_gather + remap (allgather_local_permute_fusion)
-  - finalize(): fused unpermute + reduce_scatter (unpermute_reducescatter_fusion)
+  - prepare(): quantize local chunk, then fused all_gather + remap
+  - finalize(): fused unpermute + reduce_scatter
 """
 
 import torch
@@ -17,15 +17,19 @@ from vllm.distributed.device_communicators.all2all import (
     DeepSymmAll2AllManager,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.utils import (
+    moe_kernel_quantize_input,
+)
 
 
 class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Sequence-parallel PrepareFinalize backed by DeepSymm SymmBuffer.
 
-    prepare(): fused all_gather + permute to expert-grouped layout via
-    SymmBuffer.allgather_local_permute_fusion. Returns pre-permuted tensor
-    with rows_per_expert metadata for grouped GEMM.
+    prepare(): quantize local chunk (when quant_config specifies it),
+    then fused all_gather + permute to expert-grouped layout via
+    SymmBuffer. For quantized paths, uses allgather_local_permute_fusion_with_scale
+    to gather both data and scales in one fused kernel.
 
     finalize(): fused unpermute + reduce_scatter via
     SymmBuffer.unpermute_reducescatter_fusion. Produces local-chunk output.
@@ -77,6 +81,24 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         tp_size = get_tp_group().world_size
         total_rows = num_rows * tp_size
 
+        # Quantize local chunk before allgather to reduce comm bandwidth.
+        a1q_scale = None
+        if not defer_input_quant and quant_config.quant_dtype is not None:
+            input_sf = (
+                quant_config.a1_gscale
+                if quant_config.use_nvfp4_w4a4
+                else quant_config.a1_scale
+            )
+            a1, a1q_scale = moe_kernel_quantize_input(
+                a1,
+                input_sf,
+                quant_dtype=quant_config.quant_dtype,
+                per_act_token_quant=quant_config.per_act_token_quant,
+                block_shape=quant_config.block_shape,
+                is_scale_swizzled=False,
+                mx_alignment=quant_config.mx_alignment,
+            )
+
         sbuf = self.all2all_manager.get_sbuf(hidden_size, n_experts_per_token)
 
         remapped_hidden_states = torch.empty(
@@ -85,13 +107,29 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             device=a1.device,
         )
 
-        _, symm_handle = sbuf.allgather_local_permute_fusion(
-            hidden_shard=a1,
-            topk_idx=topk_ids,
-            topk_weights=topk_weights,
-            num_experts=num_experts,
-            remap_hidden_states=remapped_hidden_states,
-        )
+        if a1q_scale is not None:
+            # Fused allgather + remap for both quantized data and scales.
+            _, remapped_scale, symm_handle = (
+                sbuf.allgather_local_permute_fusion_with_scale(
+                    hidden_shard=a1,
+                    topk_idx=topk_ids,
+                    topk_weights=topk_weights,
+                    num_experts=num_experts,
+                    remap_hidden_states=remapped_hidden_states,
+                    scale=a1q_scale,
+                )
+            )
+            a1q_scale = remapped_scale
+        else:
+            # BF16 path: no quantization, just allgather + remap.
+            _, symm_handle = sbuf.allgather_local_permute_fusion(
+                hidden_shard=a1,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=num_experts,
+                remap_hidden_states=remapped_hidden_states,
+            )
+
         self.all2all_manager.symm_handle = symm_handle
 
         rows_per_expert = symm_handle.rows_per_expert
@@ -103,7 +141,6 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # topk_ids/topk_weights are no longer needed for permutation
         # (already applied by allgather_local_permute_fusion), but the
         # modular kernel interface requires them for workspace allocation.
-        # Return gathered versions for shape consistency.
         gathered_topk_ids = torch.empty(
             (total_rows, n_experts_per_token),
             dtype=topk_ids.dtype,
@@ -117,7 +154,7 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         return (
             remapped_hidden_states,
-            None,
+            a1q_scale,
             expert_tokens_meta,
             gathered_topk_ids,
             gathered_topk_weights,

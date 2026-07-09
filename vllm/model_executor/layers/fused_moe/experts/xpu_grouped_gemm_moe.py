@@ -61,7 +61,7 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return True
+        return False
 
     def moe_problem_size(
         self,
@@ -174,8 +174,13 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         rows_per_expert = expert_tokens_meta.expert_num_tokens
 
         num_experts = self.moe_config.num_local_experts
-        hidden_size = hidden_states.size(-1)
         num_moe_inputs = hidden_states.size(0)
+        hidden_size = hidden_states.size(-1)
+
+        assert hidden_states.dtype == torch.bfloat16, (
+            f"XPUGroupedGemmExperts only supports BF16 input, "
+            f"got {hidden_states.dtype}"
+        )
 
         # XPU weight layout: [E, K, N] — N is the last dim
         inter_size = w1.shape[-1] // 2
@@ -186,9 +191,8 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         gemm1_output = workspace13[:num_moe_inputs, :2 * inter_size]
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=hidden_states,
-            ptr_A_scale=None,
             ptr_B=w1,
-            ptr_B_scale=self.w1_scale,
+            ptr_scales=self.w1_scale,
             ptr_bias=self.w1_bias,
             ptr_D=gemm1_output,
             rows_per_expert=rows_per_expert,
@@ -206,9 +210,8 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         # gemm2: act_output @ w2 -> output
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
-            ptr_A_scale=None,
             ptr_B=w2,
-            ptr_B_scale=self.w2_scale,
+            ptr_scales=self.w2_scale,
             ptr_bias=self.w2_bias,
             ptr_D=output,
             rows_per_expert=rows_per_expert,
