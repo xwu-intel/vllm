@@ -92,7 +92,7 @@ def get_mem_info_wrapper(
         )
 
     # Call the underlying C++ implementation
-    free, total = torch.xpu.mem_get_info(device)
+    free, total = torch.ops._C_cache_ops.getMemoryInfo(device)
 
     return free, total
 
