@@ -110,6 +110,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         SUPPORTED_W_A = [
             (None, None),
             (kFp8StaticTensorSym, None),
+            (kFp8StaticTensorSym, kFp8StaticTensorSym),
             (kFp8StaticTensorSym, kFp8DynamicTensorSym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
@@ -205,6 +206,7 @@ class XPUExpertsFp8(XPUExperts):
     ) -> bool:
         SUPPORTED_W_A = [
             (kFp8StaticTensorSym, None),
+            (kFp8StaticTensorSym, kFp8StaticTensorSym),
             (kFp8StaticTensorSym, kFp8DynamicTensorSym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
