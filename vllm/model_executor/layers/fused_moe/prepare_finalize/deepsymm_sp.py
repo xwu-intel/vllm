@@ -107,7 +107,14 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             device=a1.device,
         )
 
-        if a1q_scale is not None:
+        # Per-token-group scales (block FP8, MXFP) need to be gathered
+        # and remapped together with the data. Per-tensor scales (scalar)
+        # are shared across all tokens/ranks and don't need gathering.
+        needs_scale_gather = (
+            a1q_scale is not None and a1q_scale.numel() > 1
+        )
+
+        if needs_scale_gather:
             # Fused allgather + remap for both quantized data and scales.
             _, remapped_scale, symm_handle = (
                 sbuf.allgather_local_permute_fusion_with_scale(
@@ -121,7 +128,8 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1q_scale = remapped_scale
         else:
-            # BF16 path: no quantization, just allgather + remap.
+            # BF16 or per-tensor FP8: allgather + remap data only.
+            # Per-tensor scale (if any) passes through unchanged.
             _, symm_handle = sbuf.allgather_local_permute_fusion(
                 hidden_shard=a1,
                 topk_idx=topk_ids,

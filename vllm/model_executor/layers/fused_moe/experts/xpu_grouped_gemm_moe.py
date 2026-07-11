@@ -32,6 +32,34 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 
 
+def _dequantize_to_bf16(
+    x: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize quantized activations back to BF16.
+
+    Handles per-tensor (scalar/1D scale), block (2D scale with
+    block_size columns), and MX (e8m0fnu scale) formats.
+    """
+    out_dtype = torch.bfloat16
+    if scale.numel() == 1:
+        return x.to(out_dtype) * scale.to(out_dtype)
+    elif scale.dtype == torch.float8_e8m0fnu:
+        scale_f = (
+            scale.view(torch.uint8).to(torch.int32) - 127
+        ).exp2().to(out_dtype)
+        block_size = x.shape[-1] // scale.shape[-1]
+        scale_expanded = scale_f.repeat_interleave(block_size, dim=-1)
+        return x.to(out_dtype) * scale_expanded[..., : x.shape[-1]]
+    elif scale.ndim == 2 and scale.shape[0] == x.shape[0]:
+        block_size = x.shape[-1] // scale.shape[-1]
+        scale_expanded = scale.to(out_dtype).repeat_interleave(
+            block_size, dim=-1
+        )
+        return x.to(out_dtype) * scale_expanded[..., : x.shape[-1]]
+    else:
+        return x.to(out_dtype) * scale.to(out_dtype)
+
+
 class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
     """
     Expert kernel for pre-permuted inputs using cutlass_grouped_gemm.
@@ -175,14 +203,23 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
 
         num_experts = self.moe_config.num_local_experts
         num_moe_inputs = hidden_states.size(0)
+
+        # TODO: remove once cutlass_grouped_gemm supports ptr_A_scale.
+        curr_dev = torch.xpu.current_device()
+        support_native_lp = torch.ops._xpu_C.is_nvl_p(curr_dev)\
+            or torch.ops._xpu_C.is_cri(curr_dev)
+        if a1q_scale is not None and not support_native_lp:
+            hidden_states = _dequantize_to_bf16(hidden_states, a1q_scale)
+
         hidden_size = hidden_states.size(-1)
 
-        assert hidden_states.dtype == torch.bfloat16, (
-            f"XPUGroupedGemmExperts only supports BF16 input, "
-            f"got {hidden_states.dtype}"
+        # XPU weight layout must be [E, K, N] (transposed by
+        # prepare_fp8_moe_layer_for_xpu during weight loading).
+        assert w1.shape[1] == hidden_size, (
+            f"XPUGroupedGemmExperts expects weights in [E, K, N] layout "
+            f"(K={hidden_size}), but got w1.shape={list(w1.shape)}. "
+            f"Ensure prepare_fp8_moe_layer_for_xpu ran during weight loading."
         )
-
-        # XPU weight layout: [E, K, N] — N is the last dim
         inter_size = w1.shape[-1] // 2
         is_relu2_no_mul = (activation == MoEActivation.RELU2_NO_MUL)
         inter_size_scale = 2 if is_relu2_no_mul else 1
@@ -191,8 +228,9 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         gemm1_output = workspace13[:num_moe_inputs, :2 * inter_size]
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=hidden_states,
+            ptr_A_scale=None,
             ptr_B=w1,
-            ptr_scales=self.w1_scale,
+            ptr_B_scale=self.w1_scale,
             ptr_bias=self.w1_bias,
             ptr_D=gemm1_output,
             rows_per_expert=rows_per_expert,
@@ -210,8 +248,9 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         # gemm2: act_output @ w2 -> output
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
+            ptr_A_scale=None,
             ptr_B=w2,
-            ptr_scales=self.w2_scale,
+            ptr_B_scale=self.w2_scale,
             ptr_bias=self.w2_bias,
             ptr_D=output,
             rows_per_expert=rows_per_expert,
