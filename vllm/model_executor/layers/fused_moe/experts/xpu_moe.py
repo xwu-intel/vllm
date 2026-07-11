@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import inspect
 
-import regex as re
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -161,48 +159,32 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             f"got is_fp8={self.is_fp8}, is_int4={self.is_int4}, "
             f"is_mxfp4={self.is_mxfp4}."
         )
-        kernel_w1 = w1
-        kernel_w2 = w2
-        if self.is_mxfp4 and w1.dtype == torch.uint8:
-            kernel_w1 = w1.view(torch.float4_e2m1fn_x2)
-            kernel_w2 = w2.view(torch.float4_e2m1fn_x2)
         if self.fused_moe_impl is None:
             topk = topk_ids.size(-1)
-            ctor_params = set(inspect.signature(XpuFusedMoe.__init__).parameters)
-            ctor_kwargs = {
-                "w13": kernel_w1,
-                "w13_scales": self.w1_scale,
-                "w13_bias": self.w1_bias,
-                "w2": kernel_w2,
-                "w2_scales": self.w2_scale,
-                "w2_bias": self.w2_bias,
-                "n_experts_per_token": topk,
-                "activation": activation.value,
-                "num_experts": self.moe_config.num_local_experts,
-                "ep_rank": self.moe_config.ep_rank,
-                "ep_size": self.moe_config.ep_size,
-                "is_fp8": self.is_fp8,
-                "is_int4": self.is_int4,
-                "is_mxfp4": self.is_mxfp4,
-                "is_mxfp8": self.is_mxfp8,
-                "is_block_fp8": self.is_block_fp8,
-                "gemm1_clamp_limit": self.gemm1_clamp_limit,
-            }
-            filtered_kwargs = {k: v for k, v in ctor_kwargs.items() if k in ctor_params}
-            while True:
-                try:
-                    self.fused_moe_impl = XpuFusedMoe(**filtered_kwargs)
-                    break
-                except TypeError as exc:
-                    match = re.search(
-                        r"unexpected keyword argument '([^']+)'", str(exc)
-                    )
-                    if not match:
-                        raise
-                    unsupported_key = match.group(1)
-                    if unsupported_key not in filtered_kwargs:
-                        raise
-                    filtered_kwargs.pop(unsupported_key, None)
+            w13_val = (
+                w1.view(torch.float4_e2m1fn_x2)
+                if self.is_mxfp4 and w1.dtype == torch.uint8
+                else w1
+            )
+            w2_val = (
+                w2.view(torch.float4_e2m1fn_x2)
+                if self.is_mxfp4 and w2.dtype == torch.uint8
+                else w2
+            )
+            self.fused_moe_impl = XpuFusedMoe(
+                w13=w13_val,
+                w13_scales=self.w1_scale,
+                w13_bias=self.w1_bias,
+                w2=w2_val,
+                w2_scales=self.w2_scale,
+                w2_bias=self.w2_bias,
+                n_experts_per_token=topk,
+                activation=activation.value,
+                num_experts=self.moe_config.num_local_experts,
+                ep_rank=self.moe_config.ep_rank,
+                ep_size=self.moe_config.ep_size,
+                gemm1_clamp_limit=self.gemm1_clamp_limit,
+            )
         assert self.fused_moe_impl is not None
         self.fused_moe_impl.apply(
             output=output,
