@@ -161,6 +161,7 @@ def _moe_forward_shared(
         router_logits,
         shared_experts_input,
         input_ids,
+        sp_local_input=(hidden_dim_unpadded == -1),
     )
 
 
