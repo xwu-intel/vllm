@@ -131,6 +131,7 @@ def FusedMoEFactory(
     reduce_results: bool = True,
     ckpt_names: tuple[str, str, str] = ("gate_proj", "down_proj", "up_proj"),
     is_fused_checkpoint_transposed: bool = False,
+    enable_eager_sp: bool = False,
     n_shared_experts: int | None = None,
     router_logits_dtype: torch.dtype | None = None,
     gate: torch.nn.Module | None = None,
@@ -196,6 +197,7 @@ def FusedMoEFactory(
             up_proj) used for weight loading
         is_fused_checkpoint_transposed: Whether fused checkpoint weights and
             block scales use transposed storage.
+        enable_eager_sp: Whether eager model-level sequence parallelism is enabled
         n_shared_experts: Number of shared experts to fuse into the routed
             grouped GEMM (ROCm; requires aiter FSE or the router-append path)
         router_logits_dtype: Data type for router logits buffers
@@ -412,6 +414,7 @@ def FusedMoEFactory(
         router=router,
         routed_experts=routed_experts,
         enable_dbo=vllm_config.parallel_config.enable_dbo,
+        enable_eager_sp=enable_eager_sp,
         gate=gate,
         shared_expert_gate=shared_expert_gate,
         shared_experts=shared_experts,

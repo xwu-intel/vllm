@@ -495,6 +495,11 @@ class EngineArgs:
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
+    enable_eager_sp: bool = ParallelConfig.enable_eager_sp
+    eager_sp_threshold: int = ParallelConfig.eager_sp_threshold
+    enable_eager_sp_fuse_gemm_comms: bool = (
+        ParallelConfig.enable_eager_sp_fuse_gemm_comms
+    )
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
     moe_backend: MoEBackend = KernelConfig.moe_backend
     linear_backend: LinearBackend = KernelConfig.linear_backend
@@ -1144,6 +1149,18 @@ class EngineArgs:
             "--enable-expert-parallel",
             "-ep",
             **parallel_kwargs["enable_expert_parallel"],
+        )
+        parallel_group.add_argument(
+            "--enable-eager-sp",
+            **parallel_kwargs["enable_eager_sp"],
+        )
+        parallel_group.add_argument(
+            "--eager-sp-threshold",
+            **parallel_kwargs["eager_sp_threshold"],
+        )
+        parallel_group.add_argument(
+            "--enable-eager-sp-fuse-gemm-comms",
+            **parallel_kwargs["enable_eager_sp_fuse_gemm_comms"],
         )
         parallel_group.add_argument(
             "--enable-ep-weight-filter",
@@ -2256,6 +2273,9 @@ class EngineArgs:
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             is_moe_model=model_config.is_moe,
             enable_expert_parallel=self.enable_expert_parallel,
+            enable_eager_sp=self.enable_eager_sp,
+            eager_sp_threshold=self.eager_sp_threshold,
+            enable_eager_sp_fuse_gemm_comms=self.enable_eager_sp_fuse_gemm_comms,
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,

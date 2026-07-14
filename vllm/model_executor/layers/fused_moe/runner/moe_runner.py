@@ -247,6 +247,7 @@ class MoERunner(MoERunnerInterface):
         router: FusedMoERouter,
         routed_experts: RoutedExperts,
         enable_dbo: bool = False,
+        enable_eager_sp: bool = False,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         shared_expert_gate: torch.nn.Module | None = None,
@@ -290,13 +291,26 @@ class MoERunner(MoERunnerInterface):
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+        # When True, the model passes a local TP chunk directly and expects
+        # the runner to handle all_gather/reduce_scatter internally via the
+        # DeepSymm SP kernel (when above fusion threshold).
+        self._eager_sp = enable_eager_sp
+        self._eager_sp_fusion_threshold = (
+            get_current_vllm_config().parallel_config.eager_sp_threshold
+            if enable_eager_sp
+            else 0
+        )
         # Set by MoeSPFusionPass when compile-time SP removes the
         # all_gather/reduce_scatter around moe_forward.
         self._sp_local_last_call = False
+        self._sp_shared_already_reduced = False
         # Modular kernel for SP path (DeepSymm PrepareFinalize +
-        # GroupedGemm Experts). Created lazily on first SP call.
+        # GroupedGemm Experts). Created lazily on first SP call, or
+        # eagerly if enable_eager_sp so profiling accounts for the buffers.
         self._sp_moe_kernel: "FusedMoEKernel | None" = None
-        self._sp_max_tokens_per_rank = 4096
+        tp_size = get_current_vllm_config().parallel_config.tensor_parallel_size
+        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        self._sp_max_tokens_per_rank = (max_tokens + tp_size - 1) // tp_size
 
     def _create_sp_moe_kernel(self):
         from vllm.distributed import get_tp_group
@@ -472,13 +486,15 @@ class MoERunner(MoERunnerInterface):
         shared_output: torch.Tensor | None,
         fused_output_is_reduced: bool | None = None,
     ) -> torch.Tensor | None:
-        """All-reduce shared expert output when the combine kernel already
-        reduced fused output.
+        """All-reduce shared expert output when the fused output is already
+        reduced but shared is not.
 
-        * If the combine kernel does the reduction for fused_output, reduce
-          shared_output separately. O.w, reduce fused_output+shared_output later.
-        * If we have SP (TP=N, DP=M, EP), there is a separate AG step handled
-          in the model.
+        * If the combine kernel (or DeepSymm SP kernel) reduced fused_output,
+          shared_output must be reduced separately to match.
+        * In below-threshold eager SP, both outputs are reduce_scattered
+          together — no separate reduction needed (handled by
+          _sp_shared_already_reduced flag).
+        * If we have DP+EP SP, there is a separate AG step in the model.
         """
         if fused_output_is_reduced is None:
             fused_output_is_reduced = self._fused_output_is_reduced
@@ -486,7 +502,8 @@ class MoERunner(MoERunnerInterface):
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
-            and fused_output_is_reduced
+            and not self._sp_shared_already_reduced
+            and (fused_output_is_reduced or self._sp_local_last_call)
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
@@ -937,14 +954,27 @@ class MoERunner(MoERunnerInterface):
         # When compile-SP removed all_gather/reduce_scatter around this op,
         # we receive a local TP chunk (signaled by sp_local_input=True via
         # hidden_dim_unpadded=-1 sentinel in the compiled graph).
-        # Gate/router run on local chunk. The all_gather happens inside
-        # _apply_quant_method (after routing, before expert computation).
-        self._sp_local_last_call = sp_local_input
+        # In eager SP mode, use DeepSymm fused kernel only when above threshold.
+        # Below threshold, fall back to all_gather + standard kernel + reduce_scatter.
+        use_deepsymm = self._eager_sp and (
+            hidden_states.shape[0] >= self._eager_sp_fusion_threshold
+        )
+        below_threshold_eager_sp = self._eager_sp and not use_deepsymm
+        self._sp_local_last_call = sp_local_input or use_deepsymm
+        self._sp_shared_already_reduced = False
+
+        # Below threshold: expand local chunk to full size for standard kernel
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+            router_logits = get_tp_group().all_gather(router_logits, dim=0)
+            if shared_experts_input is not None:
+                shared_experts_input = get_tp_group().all_gather(
+                    shared_experts_input, dim=0
+                )
 
         with self._sequence_parallel_context():
-            # TODO(bnell): parts of the dispatch/combine steps will go away once
-            # #32567 lands and the remaining kernels are made MKs.  The PCP
-            # code will probably remain
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
@@ -962,6 +992,22 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
             )
 
+        # Below threshold: reduce_scatter back to local chunk.
+        # Both shared and fused outputs are reduce_scattered together,
+        # so no further reduction needed for either.
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            self._sp_local_last_call = True
+            self._sp_shared_already_reduced = True
+            if isinstance(result, tuple):
+                result = tuple(
+                    get_tp_group().reduce_scatter(t, dim=0) if t is not None else None
+                    for t in result
+                )
+            else:
+                result = get_tp_group().reduce_scatter(result, dim=0)
+
         return result
 
     #########################################################
@@ -969,7 +1015,6 @@ class MoERunner(MoERunnerInterface):
     # Old methods from FusedMoE layer. Remove when possible.
     #
     #########################################################
-
     #
     # Properties
     #
