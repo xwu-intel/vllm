@@ -43,6 +43,26 @@ class QuantizeMethodBase(ABC):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def fused_ag_apply(
+        self,
+        layer: torch.nn.Module,
+        x_shard: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        """Fused AllGather + GEMM for sequence-parallel ColumnParallelLinear."""
+        raise NotImplementedError
+
+    def fused_rs_apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        """Fused GEMM + ReduceScatter for sequence-parallel RowParallelLinear."""
+        raise NotImplementedError
+
     # Not required functions
     def embedding(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
         """Gather embeddings in the layer based on indices in the input tensor.

@@ -214,11 +214,8 @@ class HYV3MoEFused(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=hidden_states
         )
         return final_hidden_states.view(orig_shape)
 
@@ -508,18 +505,13 @@ class HYV3DecoderLayer(nn.Module):
     def _attn_fused(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        from deep_symm import async_tp
         from vllm.distributed import get_tp_group
 
         group_name = get_tp_group().device_group.group_name
         attn = self.self_attn
 
         # Fused AG + QKV GEMM
-        _, mm_outputs = async_tp.fused_all_gather_matmul(
-            hidden_states, [attn.qkv_proj.weight.t()],
-            gather_dim=0, group_name=group_name, return_A=True,
-        )
-        qkv = mm_outputs[0]
+        qkv = attn.qkv_proj.fused_ag_forward(hidden_states, group_name)
 
         q, k, v = qkv.split(
             [attn.q_size, attn.kv_size, attn.kv_size], dim=-1
@@ -536,32 +528,21 @@ class HYV3DecoderLayer(nn.Module):
         attn_output = attn_output.view(q.shape[0], -1)
 
         # Fused o_proj GEMM + RS
-        hidden_states = async_tp.fused_matmul_reduce_scatter(
-            attn_output, attn.o_proj.weight.t(),
-            "sum", 0, group_name,
-        )
+        hidden_states = attn.o_proj.fused_rs_forward(attn_output, group_name)
         return hidden_states
 
     def _mlp_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from deep_symm import async_tp
         from vllm.distributed import get_tp_group
 
         group_name = get_tp_group().device_group.group_name
         mlp = self.mlp
 
         # Fused AG + gate_up GEMM
-        _, mm_outputs = async_tp.fused_all_gather_matmul(
-            hidden_states, [mlp.gate_up_proj.weight.t()],
-            gather_dim=0, group_name=group_name, return_A=True,
-        )
-        gate_up = mm_outputs[0]
+        gate_up = mlp.gate_up_proj.fused_ag_forward(hidden_states, group_name)
         out = mlp.act_fn(gate_up)
 
         # Fused down_proj GEMM + RS
-        hidden_states = async_tp.fused_matmul_reduce_scatter(
-            out, mlp.down_proj.weight.t(),
-            "sum", 0, group_name,
-        )
+        hidden_states = mlp.down_proj.fused_rs_forward(out, group_name)
         return hidden_states
 
 
@@ -730,6 +711,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                if name not in params_dict:
+                    continue
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
@@ -752,6 +735,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                     continue
                 is_expert_weight = True
                 name_mapped = name.replace(weight_name, param_name)
+                if name_mapped not in params_dict:
+                    continue
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name_mapped, self):
                     continue
@@ -776,6 +761,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                     # So we simply skip it
                     continue
                 if name is None:
+                    continue
+                if name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue

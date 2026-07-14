@@ -495,18 +495,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def _attn_fused(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        from deep_symm import async_tp
         from vllm.distributed import get_tp_group
 
         group_name = get_tp_group().device_group.group_name
         attn = self.self_attn
 
         # Fused AG + QKV GEMM
-        _, mm_outputs = async_tp.fused_all_gather_matmul(
-            hidden_states, [attn.qkv_proj.weight.t()],
-            gather_dim=0, group_name=group_name, return_A=True,
-        )
-        qkv = mm_outputs[0]
+        qkv = attn.qkv_proj.fused_ag_forward(hidden_states, group_name)
 
         # Split → norm → rotary → attention (same as Qwen3MoeAttention.forward)
         q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
@@ -520,32 +515,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
         attn_output = attn.attn(q, k, v)
 
         # Fused o_proj GEMM + RS
-        hidden_states = async_tp.fused_matmul_reduce_scatter(
-            attn_output, attn.o_proj.weight.t(),
-            "sum", 0, group_name,
-        )
+        hidden_states = attn.o_proj.fused_rs_forward(attn_output, group_name)
         return hidden_states
 
     def _mlp_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from deep_symm import async_tp
         from vllm.distributed import get_tp_group
 
         group_name = get_tp_group().device_group.group_name
         mlp = self.mlp
 
         # Fused AG + gate_up GEMM
-        _, mm_outputs = async_tp.fused_all_gather_matmul(
-            hidden_states, [mlp.gate_up_proj.weight.t()],
-            gather_dim=0, group_name=group_name, return_A=True,
-        )
-        gate_up = mm_outputs[0]
+        gate_up = mlp.gate_up_proj.fused_ag_forward(hidden_states, group_name)
         out = mlp.act_fn(gate_up)
 
         # Fused down_proj GEMM + RS
-        hidden_states = async_tp.fused_matmul_reduce_scatter(
-            out, mlp.down_proj.weight.t(),
-            "sum", 0, group_name,
-        )
+        hidden_states = mlp.down_proj.fused_rs_forward(out, group_name)
         return hidden_states
 
 

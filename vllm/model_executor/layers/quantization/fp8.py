@@ -460,6 +460,72 @@ class Fp8LinearMethod(LinearMethodBase):
 
         return self.fp8_linear.apply_weights(layer, x, bias)
 
+    def fused_ag_apply(
+        self,
+        layer: torch.nn.Module,
+        x_shard: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        from deep_symm import async_tp
+
+        w = layer.weight
+        w_scale = layer.weight_scale
+        x_scale = getattr(layer, "input_scale", None)
+        x_scale_ub = getattr(layer, "input_scale_upper_bound", None)
+
+        x_2d = x_shard.view(-1, x_shard.shape[-1])
+        x_q, a_scale = self.fp8_linear.quant_fp8(x_2d, x_scale, x_scale_ub)
+
+        _, mm_outputs = async_tp.fused_all_gather_scaled_matmul(
+            x_q,
+            [w],
+            a_scale,
+            [w_scale],
+            gather_dim=0,
+            group_name=group_name,
+            biases=[bias],
+            result_scales=[None],
+            out_dtypes=[torch.bfloat16],
+            use_fast_accum=[False],
+        )
+        return mm_outputs[0]
+
+    def fused_rs_apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        from deep_symm import async_tp
+
+        w = layer.weight
+        w_scale = layer.weight_scale
+        x_scale = getattr(layer, "input_scale", None)
+        x_scale_ub = getattr(layer, "input_scale_upper_bound", None)
+
+        x_2d = x.view(-1, x.shape[-1])
+        x_q, a_scale = self.fp8_linear.quant_fp8(x_2d, x_scale, x_scale_ub)
+
+        output_shape = [x_2d.shape[0], w.shape[1]]
+        result = async_tp.fused_scaled_matmul_reduce_scatter(
+            x_q,
+            w,
+            a_scale,
+            w_scale,
+            "sum",
+            0,
+            0,
+            group_name,
+            output_shape,
+            bias,
+            None,
+            torch.bfloat16,
+            False,
+        )
+        return result
+
 
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.

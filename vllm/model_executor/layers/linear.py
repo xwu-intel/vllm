@@ -211,6 +211,41 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
+    def fused_ag_apply(
+        self,
+        layer: torch.nn.Module,
+        x_shard: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        from deep_symm import async_tp
+
+        W = layer.weight.t()
+        _, mm_outputs = async_tp.fused_all_gather_matmul(
+            x_shard, [W], gather_dim=0, group_name=group_name, return_A=True
+        )
+        output = mm_outputs[0]
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def fused_rs_apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        from deep_symm import async_tp
+
+        W = layer.weight.t()
+        output = async_tp.fused_matmul_reduce_scatter(
+            x, W, "sum", 0, group_name
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
 
 class LinearBase(PluggableLayer):
     """Base linear layer.
@@ -585,6 +620,13 @@ class ColumnParallelLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def fused_ag_forward(
+        self, input_shard: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        """Fused AllGather + GEMM for eager sequence parallelism."""
+        bias = self.bias if not self.skip_bias_add else None
+        return self.quant_method.fused_ag_apply(self, input_shard, bias, group_name)
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -1659,6 +1701,22 @@ class RowParallelLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def fused_rs_forward(
+        self, input_: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        """Fused GEMM + ReduceScatter for eager sequence parallelism."""
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        return self.quant_method.fused_rs_apply(
+            self, input_parallel, bias_, group_name
+        )
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size_per_partition}"
