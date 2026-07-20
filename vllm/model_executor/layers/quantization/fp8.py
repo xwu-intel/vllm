@@ -479,19 +479,19 @@ class Fp8LinearMethod(LinearMethodBase):
         x_2d = x_shard.view(-1, x_shard.shape[-1])
         x_q, a_scale = self.fp8_linear.quant_fp8(x_2d, x_scale, x_scale_ub)
 
-        _, mm_outputs = async_tp.fused_all_gather_scaled_matmul(
+        output = async_tp.fused_all_gather_scaled_matmul(
             x_q,
-            [w],
+            w,
             a_scale,
-            [w_scale],
+            w_scale,
             gather_dim=0,
             group_name=group_name,
-            biases=[bias],
-            result_scales=[None],
-            out_dtypes=[torch.bfloat16],
-            use_fast_accum=[False],
+            bias=bias,
+            result_scale=None,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=False,
         )
-        return mm_outputs[0]
+        return output
 
     def fused_rs_apply(
         self,

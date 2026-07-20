@@ -221,10 +221,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         from deep_symm import async_tp
 
         W = layer.weight.t()
-        _, mm_outputs = async_tp.fused_all_gather_matmul(
-            x_shard, [W], gather_dim=0, group_name=group_name, return_A=True
+        output = async_tp.fused_all_gather_matmul(
+            x_shard, W, gather_dim=0, group_name=group_name
         )
-        output = mm_outputs[0]
         if bias is not None:
             output = output + bias
         return output
