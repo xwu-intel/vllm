@@ -101,19 +101,30 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 mx_alignment=quant_config.mx_alignment,
             )
 
-        sbuf = self.all2all_manager.get_sbuf(hidden_size, n_experts_per_token)
-
-        remapped_hidden_states = torch.empty(
-            (total_rows * n_experts_per_token, hidden_size),
-            dtype=a1.dtype,
-            device=a1.device,
-        )
-
+        # Determine scale dispatch parameters for SymmBuffer.
         # Per-token-group scales (block FP8, MXFP) need to be gathered
         # and remapped together with the data. Per-tensor scales (scalar)
         # are shared across all tokens/ranks and don't need gathering.
         needs_scale_gather = (
             a1q_scale is not None and a1q_scale.numel() > 1
+        )
+        if needs_scale_gather:
+            dispatch_group_size = hidden_size // a1q_scale.shape[-1]
+            dispatch_scale_dtype = a1q_scale.dtype
+        else:
+            dispatch_group_size = None
+            dispatch_scale_dtype = torch.float32
+
+        sbuf = self.all2all_manager.get_sbuf(
+            hidden_size, n_experts_per_token,
+            dispatch_scale_dtype=dispatch_scale_dtype,
+            dispatch_group_size=dispatch_group_size,
+        )
+
+        remapped_hidden_states = torch.empty(
+            (total_rows * n_experts_per_token, hidden_size),
+            dtype=a1.dtype,
+            device=a1.device,
         )
 
         if os.environ.get("VLLM_SP_DEBUG", "0") == "1":

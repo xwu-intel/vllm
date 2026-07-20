@@ -1111,7 +1111,13 @@ class DeepSymmAll2AllManager(All2AllManagerBase):
         self._sbuf = None
         self._symm_handle = None
 
-    def get_sbuf(self, hidden_size: int, num_topk: int):
+    def get_sbuf(
+        self,
+        hidden_size: int,
+        num_topk: int,
+        dispatch_scale_dtype: torch.dtype = torch.float32,
+        dispatch_group_size: int | None = None,
+    ):
         if self._sbuf is None:
             from deep_symm.moe_tp import SymmBuffer
 
@@ -1120,6 +1126,8 @@ class DeepSymmAll2AllManager(All2AllManagerBase):
                 num_max_tokens_per_rank=self._max_tokens_per_rank,
                 hidden=hidden_size,
                 num_topk=num_topk,
+                dispatch_scale_dtype=dispatch_scale_dtype,
+                dispatch_group_size=dispatch_group_size,
             )
         return self._sbuf
 
