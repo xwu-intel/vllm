@@ -838,6 +838,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         parallel_config = vllm_config.parallel_config
         self.hidden_size = config.hidden_size
         self.eager_sp = parallel_config.use_eager_sequence_parallel
+        # Fuse the output projection GEMM with its reduce-scatter (GEMM+RS via
+        # deep_symm.async_tp) when eager SP is active and the token count is
+        # large enough to amortise the fused kernel launch.
+        self.fuse_gemm_comms = (
+            parallel_config.enable_eager_sp_fuse_gemm_comms and self.eager_sp
+        )
+        self._sp_threshold = parallel_config.eager_sp_threshold
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4XPUAttention(
@@ -1048,13 +1055,27 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
-        # DeepSeek V4 MLA uses custom replicated input projections and a
-        # grouped-BMM output projection, so use explicit collectives rather
-        # than the generic fused linear helpers.
+        # DeepSeek V4 MLA consumes the full-sequence hidden states in several
+        # internal projections (fused_wqa_wkv, indexer, compressor), so the
+        # input all-gather cannot be folded into a single AG+GEMM. When
+        # fuse_gemm_comms is enabled above threshold we still overlap the
+        # output projection GEMM with its reduce-scatter (GEMM+RS) on wo_b;
+        # otherwise fall back to explicit all-gather / reduce-scatter.
         x = self.attn_norm(x)
+        use_fused = self.fuse_gemm_comms and x.shape[0] >= self._sp_threshold
         x = tensor_model_parallel_all_gather(x, dim=0)
-        x = self.attn(positions, x, None)
-        x = tensor_model_parallel_reduce_scatter(x, dim=0)
+        if use_fused:
+            from vllm.distributed import get_tp_group
+
+            group_name = get_tp_group().device_group.group_name
+            self.attn.sp_fused_rs_group = group_name
+            try:
+                x = self.attn(positions, x, None)
+            finally:
+                self.attn.sp_fused_rs_group = None
+        else:
+            x = self.attn(positions, x, None)
+            x = tensor_model_parallel_reduce_scatter(x, dim=0)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,

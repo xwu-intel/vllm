@@ -54,6 +54,10 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             super().__init__(*args, **kwargs)
         finally:
             torch.cuda.Event = _orig_event  # type: ignore[misc]
+        # Process-group name enabling the fused wo_b GEMM+ReduceScatter path
+        # under eager sequence parallelism. Set per-forward by the decoder
+        # layer (None -> plain wo_b GEMM).
+        self.sp_fused_rs_group: str | None = None
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         from typing import cast
@@ -119,7 +123,12 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             None,
         )
 
-        return self.wo_b(z.transpose(0, 1).flatten(1))
+        z = z.transpose(0, 1).flatten(1)
+        if self.sp_fused_rs_group is not None:
+            # Fuse the output projection GEMM with its reduce-scatter for
+            # eager sequence parallelism (returns tokens sharded over TP).
+            return self.wo_b.fused_rs_forward(z, self.sp_fused_rs_group)
+        return self.wo_b(z)
 
     def forward_mqa(
         self,
