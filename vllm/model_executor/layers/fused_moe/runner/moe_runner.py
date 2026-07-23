@@ -956,8 +956,25 @@ class MoERunner(MoERunnerInterface):
         # hidden_dim_unpadded=-1 sentinel in the compiled graph).
         # In eager SP mode, use DeepSymm fused kernel only when above threshold.
         # Below threshold, fall back to all_gather + standard kernel + reduce_scatter.
-        use_deepsymm = self._eager_sp and (
-            hidden_states.shape[0] >= self._eager_sp_fusion_threshold
+        #
+        # The DeepSymm fused SP dispatch pre-quantizes the activation to the
+        # expert input dtype (e.g. FP8) before the all-gather, while the fused
+        # combine (unpermute + reduce-scatter) requires a 16-bit accumulation
+        # dtype and shares the same symmetric-memory workspace. A single
+        # SymmBuffer therefore cannot serve an FP8 dispatch and a BF16 combine,
+        # so the fused path is only valid for unquantized (BF16) experts. For
+        # quantized experts (e.g. block-FP8 in DeepSeek V4) fall back to the
+        # below-threshold all-gather + standard kernel + reduce-scatter path.
+        moe_quant_config = getattr(
+            self.routed_experts.quant_method, "moe_quant_config", None
+        )
+        sp_fused_supported = (
+            moe_quant_config is None or moe_quant_config.quant_dtype is None
+        )
+        use_deepsymm = (
+            self._eager_sp
+            and sp_fused_supported
+            and hidden_states.shape[0] >= self._eager_sp_fusion_threshold
         )
         below_threshold_eager_sp = self._eager_sp and not use_deepsymm
         self._sp_local_last_call = sp_local_input or use_deepsymm
