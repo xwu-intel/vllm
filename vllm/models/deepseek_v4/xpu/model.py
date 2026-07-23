@@ -838,12 +838,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         parallel_config = vllm_config.parallel_config
         self.hidden_size = config.hidden_size
         self.eager_sp = parallel_config.use_eager_sequence_parallel
-        # Fuse the output projection GEMM with its reduce-scatter (GEMM+RS via
-        # deep_symm.async_tp) when eager SP is active and the token count is
-        # large enough to amortise the fused kernel launch.
-        self.fuse_gemm_comms = (
-            parallel_config.enable_eager_sp_fuse_gemm_comms and self.eager_sp
-        )
         self._sp_threshold = parallel_config.eager_sp_threshold
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -857,6 +851,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The output projection produces one TP partial per rank. Eager SP
             # combines and shards those partials with reduce-scatter.
             self.attn.wo_b.reduce_results = False
+
+        # Fuse the output projection GEMM with its reduce-scatter (GEMM+RS via
+        # deep_symm.async_tp) when eager SP is active and the token count is
+        # large enough to amortise the fused kernel launch. The fused kernel
+        # only supports a per-tensor weight scale or an unquantized weight;
+        # DeepSeek V4's wo_b uses block-wise FP8 (``weight_scale_inv``), which
+        # is not supported, so fall back to an explicit reduce-scatter there.
+        wo_b_fusable = not hasattr(self.attn.wo_b, "weight_scale_inv")
+        self.fuse_gemm_comms = (
+            parallel_config.enable_eager_sp_fuse_gemm_comms
+            and self.eager_sp
+            and wo_b_fusable
+        )
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
