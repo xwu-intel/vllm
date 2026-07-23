@@ -9,6 +9,8 @@ This PrepareFinalize uses DeepSymm SymmBuffer fused kernels:
   - finalize(): fused unpermute + reduce_scatter
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -113,6 +115,15 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         needs_scale_gather = (
             a1q_scale is not None and a1q_scale.numel() > 1
         )
+
+        if os.environ.get("VLLM_SP_DEBUG", "0") == "1":
+            if get_tp_group().rank_in_group == 0:
+                print(
+                    f"[SP-DEBUG][rank=0] "
+                    f"DeepSymm prepare(): tokens={num_rows} hidden={hidden_size} "
+                    f"a1.dtype={a1.dtype} needs_scale_gather={needs_scale_gather}",
+                    flush=True,
+                )
 
         if needs_scale_gather:
             # Fused allgather + remap for both quantized data and scales.

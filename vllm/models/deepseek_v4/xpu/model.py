@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1070,6 +1071,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         # otherwise fall back to explicit all-gather / reduce-scatter.
         x = self.attn_norm(x)
         use_fused = self.fuse_gemm_comms and x.shape[0] >= self._sp_threshold
+        if os.environ.get("VLLM_SP_DEBUG", "0") == "1":
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"[SP-DEBUG][rank=0] "
+                    f"decoder eager_sp attn: local_tokens={x.shape[0]} "
+                    f"fuse_gemm_comms={self.fuse_gemm_comms} "
+                    f"threshold={self._sp_threshold} "
+                    f"-> use_fused(wo_b RS)={use_fused}",
+                    flush=True,
+                )
         x = tensor_model_parallel_all_gather(x, dim=0)
         if use_fused:
             from vllm.distributed import get_tp_group
