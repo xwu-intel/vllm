@@ -969,6 +969,8 @@ class MoERunner(MoERunnerInterface):
 
             hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
             router_logits = get_tp_group().all_gather(router_logits, dim=0)
+            if input_ids is not None:
+                input_ids = get_tp_group().all_gather(input_ids, dim=0)
             if shared_experts_input is not None:
                 shared_experts_input = get_tp_group().all_gather(
                     shared_experts_input, dim=0
