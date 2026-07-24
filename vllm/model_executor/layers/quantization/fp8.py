@@ -48,10 +48,12 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
+    per_token_group_quant_fp8,
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
     validate_fp8_block_shape,
+    w8a8_triton_block_scaled_mm,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
@@ -500,12 +502,50 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from deep_symm import async_tp
 
+        x_2d = x.view(-1, x.shape[-1])
+
+        if self.block_quant:
+            # Block-wise FP8 (e.g. DeepSeek V4): per-token-group activation
+            # scale + per-block weight scale. torch._scaled_mm cannot consume
+            # 2D block scales, so delegate the GEMM to the Triton block kernel
+            # and let DeepSymm own the pipelined reduce-scatter.
+            assert self.weight_block_size is not None
+            block_n, block_k = self.weight_block_size
+            w = layer.weight  # [N, K] fp8
+            w_scale = layer.weight_scale_inv  # [ceil(N/block_n), ceil(K/block_k)]
+            x_q, a_scale = per_token_group_quant_fp8(x_2d, group_size=block_k)
+
+            def block_mm(
+                a_q_shard: torch.Tensor, a_scale_shard: torch.Tensor
+            ) -> torch.Tensor:
+                out = w8a8_triton_block_scaled_mm(
+                    a_q_shard,
+                    w,
+                    a_scale_shard,
+                    w_scale,
+                    [block_n, block_k],
+                    torch.bfloat16,
+                )
+                if bias is not None:
+                    out = out + bias
+                return out
+
+            return async_tp.fused_block_scaled_matmul_reduce_scatter(
+                x_q,
+                a_scale,
+                w.shape[0],
+                "sum",
+                0,
+                group_name,
+                block_mm,
+                torch.bfloat16,
+            )
+
         w = layer.weight
         w_scale = layer.weight_scale
         x_scale = getattr(layer, "input_scale", None)
         x_scale_ub = getattr(layer, "input_scale_upper_bound", None)
 
-        x_2d = x.view(-1, x.shape[-1])
         x_q, a_scale = self.fp8_linear.quant_fp8(x_2d, x_scale, x_scale_ub)
 
         output_shape = [x_2d.shape[0], w.shape[1]]

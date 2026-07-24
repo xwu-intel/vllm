@@ -855,15 +855,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # Fuse the output projection GEMM with its reduce-scatter (GEMM+RS via
         # deep_symm.async_tp) when eager SP is active and the token count is
-        # large enough to amortise the fused kernel launch. The fused kernel
-        # only supports a per-tensor weight scale or an unquantized weight;
-        # DeepSeek V4's wo_b uses block-wise FP8 (``weight_scale_inv``), which
-        # is not supported, so fall back to an explicit reduce-scatter there.
-        wo_b_fusable = not hasattr(self.attn.wo_b, "weight_scale_inv")
+        # large enough to amortise the fused kernel launch. Per-tensor,
+        # unquantized, and block-wise FP8 (``weight_scale_inv``) weights are all
+        # supported: block FP8 delegates the GEMM to the Triton block kernel in
+        # ``fused_rs_apply``.
         self.fuse_gemm_comms = (
             parallel_config.enable_eager_sp_fuse_gemm_comms
             and self.eager_sp
-            and wo_b_fusable
         )
         self.ffn = DeepseekV4MoE(
             vllm_config,
