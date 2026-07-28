@@ -978,9 +978,13 @@ class MoERunner(MoERunnerInterface):
         )
         below_threshold_eager_sp = self._eager_sp and not use_deepsymm
         self._sp_local_last_call = sp_local_input or use_deepsymm
-        self._sp_shared_already_reduced = False
+        # When eager SP is active, shared experts have replicated weights and
+        # always compute on the local chunk — output is already correct.
+        self._sp_shared_already_reduced = self._eager_sp
 
-        # Below threshold: expand local chunk to full size for standard kernel
+        # Below threshold: expand local chunk to full size for standard kernel.
+        # Only routed experts need full tokens; shared experts (replicated
+        # weights) compute on the local chunk directly.
         if below_threshold_eager_sp:
             from vllm.distributed import get_tp_group
 
@@ -988,10 +992,6 @@ class MoERunner(MoERunnerInterface):
             router_logits = get_tp_group().all_gather(router_logits, dim=0)
             if input_ids is not None:
                 input_ids = get_tp_group().all_gather(input_ids, dim=0)
-            if shared_experts_input is not None:
-                shared_experts_input = get_tp_group().all_gather(
-                    shared_experts_input, dim=0
-                )
 
         with self._sequence_parallel_context():
             hidden_states, router_logits = self._maybe_dispatch(
@@ -1011,19 +1011,17 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
             )
 
-        # Below threshold: reduce_scatter back to local chunk.
-        # Both shared and fused outputs are reduce_scattered together,
-        # so no further reduction needed for either.
+        # Below threshold: reduce_scatter routed output back to local chunk.
+        # Shared output is already local-chunk-sized (replicated weights),
+        # so only the fused (routed) output needs reduce_scatter.
         if below_threshold_eager_sp:
             from vllm.distributed import get_tp_group
 
             self._sp_local_last_call = True
-            self._sp_shared_already_reduced = True
             if isinstance(result, tuple):
-                result = tuple(
-                    get_tp_group().reduce_scatter(t, dim=0) if t is not None else None
-                    for t in result
-                )
+                shared_out, fused_out = result
+                fused_out = get_tp_group().reduce_scatter(fused_out, dim=0)
+                result = (shared_out, fused_out)
             else:
                 result = get_tp_group().reduce_scatter(result, dim=0)
 

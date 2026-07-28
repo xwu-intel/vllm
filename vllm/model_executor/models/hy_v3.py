@@ -95,6 +95,7 @@ class HYV3FeedForward(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         expert_gate: torch.nn.Linear | None = None,
+        disable_tp: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -103,6 +104,7 @@ class HYV3FeedForward(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -111,6 +113,7 @@ class HYV3FeedForward(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -174,6 +177,7 @@ class HYV3MoEFused(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}",
                 reduce_results=False,
+                disable_tp=self.enable_eager_sp,
             )
         else:
             self.shared_mlp = None
@@ -467,8 +471,7 @@ class HYV3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         use_fused = (
-            self.fuse_gemm_comms
-            and hidden_states.shape[0] >= self._sp_threshold
+            self.fuse_gemm_comms and hidden_states.shape[0] >= self._sp_threshold
         )
 
         if use_fused:
@@ -479,9 +482,7 @@ class HYV3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            hidden_states = tensor_model_parallel_reduce_scatter(
-                hidden_states, dim=0
-            )
+            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, dim=0)
 
         # Post-attention norm on local chunk
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -492,9 +493,7 @@ class HYV3DecoderLayer(nn.Module):
             if use_fused:
                 hidden_states = self._mlp_fused(hidden_states)
             else:
-                hidden_states = tensor_model_parallel_all_gather(
-                    hidden_states, dim=0
-                )
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
                 hidden_states = self.mlp(hidden_states)
                 hidden_states = tensor_model_parallel_reduce_scatter(
                     hidden_states, dim=0
@@ -513,9 +512,7 @@ class HYV3DecoderLayer(nn.Module):
         # Fused AG + QKV GEMM
         qkv = attn.qkv_proj.fused_ag_forward(hidden_states, group_name)
 
-        q, k, v = qkv.split(
-            [attn.q_size, attn.kv_size, attn.kv_size], dim=-1
-        )
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
         if attn.use_qk_norm:
             q = attn.q_norm(
                 q.view(*q.shape[:-1], q.shape[-1] // attn.head_dim, attn.head_dim)
@@ -578,8 +575,7 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                 prefix=prefix,
                 eager_sp=self.eager_sp,
                 fuse_gemm_comms=(
-                    parallel_config.enable_eager_sp_fuse_gemm_comms
-                    and self.eager_sp
+                    parallel_config.enable_eager_sp_fuse_gemm_comms and self.eager_sp
                 ),
                 sp_threshold=parallel_config.eager_sp_threshold,
             ),
