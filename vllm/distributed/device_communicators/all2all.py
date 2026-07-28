@@ -1115,6 +1115,7 @@ class DeepSymmAll2AllManager(All2AllManagerBase):
         self,
         hidden_size: int,
         num_topk: int,
+        hidden_dtype: torch.dtype = torch.bfloat16,
         dispatch_scale_dtype: torch.dtype = torch.float32,
         dispatch_group_size: int | None = None,
     ):
@@ -1126,6 +1127,7 @@ class DeepSymmAll2AllManager(All2AllManagerBase):
                 num_max_tokens_per_rank=self._max_tokens_per_rank,
                 hidden=hidden_size,
                 num_topk=num_topk,
+                hidden_dtype=hidden_dtype,
                 dispatch_scale_dtype=dispatch_scale_dtype,
                 dispatch_group_size=dispatch_group_size,
             )

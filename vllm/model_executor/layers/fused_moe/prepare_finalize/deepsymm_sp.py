@@ -116,7 +116,8 @@ class XPUDeepSymmPrepareFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dispatch_scale_dtype = torch.float32
 
         sbuf = self.all2all_manager.get_sbuf(
-            hidden_size, n_experts_per_token,
+            hidden_size,
+            n_experts_per_token,
             dispatch_scale_dtype=dispatch_scale_dtype,
             dispatch_group_size=dispatch_group_size,
         )
