@@ -204,38 +204,48 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         num_experts = self.moe_config.num_local_experts
         num_moe_inputs = hidden_states.size(0)
 
-        # TODO: remove once cutlass_grouped_gemm supports ptr_A_scale.
         curr_dev = torch.xpu.current_device()
-        support_native_lp = torch.ops._xpu_C.is_nvl_p(curr_dev)\
+        support_native_lp = torch.ops._xpu_C.is_nvl_p(curr_dev) \
             or torch.ops._xpu_C.is_cri(curr_dev)
+
+        # Dequantize if hardware doesn't support native low-precision GEMM
         if a1q_scale is not None and not support_native_lp:
             hidden_states = _dequantize_to_bf16(hidden_states, a1q_scale)
+            a1q_scale = None
 
         hidden_size = hidden_states.size(-1)
+        # MXFP4 packs 2 values per byte — logical hidden dim is 2x stored
+        gemm_hidden_size = 2 * hidden_size if self.is_mxfp4 else hidden_size
 
         # XPU weight layout must be [E, K, N] (transposed by
         # prepare_fp8_moe_layer_for_xpu during weight loading).
-        assert w1.shape[1] == hidden_size, (
-            f"XPUGroupedGemmExperts expects weights in [E, K, N] layout "
-            f"(K={hidden_size}), but got w1.shape={list(w1.shape)}. "
-            f"Ensure prepare_fp8_moe_layer_for_xpu ran during weight loading."
-        )
         inter_size = w1.shape[-1] // 2
         is_relu2_no_mul = (activation == MoEActivation.RELU2_NO_MUL)
         inter_size_scale = 2 if is_relu2_no_mul else 1
+
+        # Prepare activation scales for GEMM1
+        gemm1_a_scale = None
+        if a1q_scale is not None:
+            total_padded = a1q_scale.shape[0] + 3 * num_experts
+            if a1q_scale.dtype == torch.float8_e8m0fnu:
+                gemm1_a_scale = torch.ops._moe_C.reorder_mxfp_scales(
+                    a1q_scale, rows_per_expert, total_padded
+                )
+            else:
+                gemm1_a_scale = a1q_scale
 
         # gemm1: hidden_states @ w13 -> workspace13
         gemm1_output = workspace13[:num_moe_inputs, :2 * inter_size]
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=hidden_states,
-            ptr_A_scale=None,
+            ptr_A_scale=gemm1_a_scale,
             ptr_B=w1,
             ptr_B_scale=self.w1_scale,
             ptr_bias=self.w1_bias,
             ptr_D=gemm1_output,
             rows_per_expert=rows_per_expert,
             N=2 * inter_size,
-            K=hidden_size,
+            K=gemm_hidden_size,
             num_experts=num_experts,
             is_B_int4=self.is_int4,
             is_B_mxfp4=self.is_mxfp4,
@@ -245,16 +255,40 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
         act_output = workspace2[:num_moe_inputs, :inter_size * inter_size_scale]
         apply_moe_activation(activation, act_output, gemm1_output)
 
+        # Prepare activation scales for GEMM2
+        gemm2_a_scale = None
+        if a1q_scale is not None and support_native_lp:
+            if a2_scale is not None:
+                # Static FP8: quantize with pre-computed scale
+                from vllm import _custom_ops as ops
+                act_output, gemm2_a_scale = ops.scaled_fp8_quant(
+                    act_output, a2_scale,
+                )
+            else:
+                # Dynamic quant (FP8, MXFP, block, etc.)
+                from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+                    _quantize_input,
+                )
+                act_output, gemm2_a_scale = _quantize_input(
+                    act_output, self.quant_config
+                )
+            if gemm2_a_scale is not None \
+                    and gemm2_a_scale.dtype == torch.float8_e8m0fnu:
+                total_padded = gemm2_a_scale.shape[0] + 3 * num_experts
+                gemm2_a_scale = torch.ops._moe_C.reorder_mxfp_scales(
+                    gemm2_a_scale, rows_per_expert, total_padded
+                )
+
         # gemm2: act_output @ w2 -> output
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
-            ptr_A_scale=None,
+            ptr_A_scale=gemm2_a_scale,
             ptr_B=w2,
             ptr_B_scale=self.w2_scale,
             ptr_bias=self.w2_bias,
             ptr_D=output,
             rows_per_expert=rows_per_expert,
-            N=hidden_size,
+            N=gemm_hidden_size,
             K=inter_size * inter_size_scale,
             num_experts=num_experts,
             is_B_int4=self.is_int4,
