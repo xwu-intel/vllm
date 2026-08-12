@@ -18,6 +18,7 @@ from vllm.config import (
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
     fused_grouped_topk,
+    grouped_topk,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -68,6 +69,28 @@ def _single_group_reference(
         values /= values.sum(dim=-1, keepdim=True) + 1e-20
     values *= routed_scaling_factor
     return values, indices.to(torch.int32)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_xpu(), reason="This test requires an XPU platform."
+)
+def test_grouped_topk_stable_ties_xpu():
+    logits = torch.zeros((1, 8), dtype=torch.float32, device="xpu")
+    hidden_states = torch.empty((1, 0), dtype=torch.float32, device="xpu")
+
+    _, topk_ids = grouped_topk(
+        hidden_states=hidden_states,
+        gating_output=logits,
+        topk=3,
+        renormalize=False,
+        num_expert_group=4,
+        topk_group=2,
+        scoring_func="softmax",
+    )
+
+    torch.testing.assert_close(
+        topk_ids, torch.tensor([[0, 1, 2]], dtype=torch.int32, device="xpu")
+    )
 
 
 @pytest.mark.skipif(
