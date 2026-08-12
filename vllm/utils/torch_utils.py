@@ -892,11 +892,26 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
         if cpu_tensor.numel() == 0:
             return torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device="xpu")
         if not cpu_tensor.is_pinned():
-            contiguous_cpu = cpu_tensor.contiguous()
-            pinned = torch.empty_like(contiguous_cpu, pin_memory=True)
-            pinned.copy_(contiguous_cpu)
+            pinned = torch.empty_strided(
+                cpu_tensor.size(),
+                cpu_tensor.stride(),
+                dtype=cpu_tensor.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            pinned.copy_(cpu_tensor)
             cpu_tensor = pinned
-        return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+        if cpu_tensor.is_contiguous():
+            return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+
+        storage_numel = (
+            cpu_tensor.untyped_storage().nbytes() // cpu_tensor.element_size()
+        )
+        storage_view = cpu_tensor.as_strided((storage_numel,), (1,), 0)
+        xpu_storage_view = torch.ops._C.get_xpu_view_from_cpu_tensor(storage_view)
+        return xpu_storage_view.as_strided(
+            cpu_tensor.size(), cpu_tensor.stride(), cpu_tensor.storage_offset()
+        )
     elif current_platform.is_cuda_alike():
         return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
     else:

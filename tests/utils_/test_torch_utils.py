@@ -8,12 +8,26 @@ from vllm.utils.torch_utils import (
     available_cpu_count,
     common_broadcastable_dtype,
     current_stream,
+    get_accelerator_view_from_cpu_tensor,
     get_kv_cache_torch_dtype,
     is_lossless_cast,
     is_quantized_kv_cache,
     set_torch_threads_for_runtime,
     startup_omp_num_threads,
 )
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is not available")
+def test_xpu_uva_preserves_pinned_tensor_layout() -> None:
+    cpu_tensor = torch.arange(12, device="cpu", pin_memory=True).view(3, 4).t()
+    assert not cpu_tensor.is_contiguous()
+
+    result = get_accelerator_view_from_cpu_tensor(cpu_tensor)
+
+    assert not result.is_contiguous()
+    assert result.stride() == cpu_tensor.stride()
+    assert result.t().is_contiguous()
+    torch.testing.assert_close(result.cpu(), cpu_tensor)
 
 
 def test_nvfp4_4over6_cache_dtype() -> None:
