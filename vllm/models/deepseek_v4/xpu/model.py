@@ -697,6 +697,9 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                is_sequence_parallel=(
+                    self.is_sequence_parallel or self.enable_eager_sp
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
 
