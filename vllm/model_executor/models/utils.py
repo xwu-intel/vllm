@@ -984,7 +984,8 @@ def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     remainder = seq_len % tp_size
     if remainder != 0:
         pad_len = tp_size - remainder
-        y = nn.functional.pad(x, (0, 0, 0, pad_len))
+        padding = x.new_zeros((pad_len, *x.shape[1:]))
+        y = torch.cat((x, padding), dim=0)
     else:
         y = x
 

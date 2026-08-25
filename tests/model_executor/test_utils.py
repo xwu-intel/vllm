@@ -5,8 +5,10 @@
 import pytest
 import torch
 
+from vllm.model_executor.models import utils as model_utils
 from vllm.model_executor.parameter import ModelWeightParameter, PackedvLLMParameter
 from vllm.model_executor.utils import replace_parameter
+from vllm.models.common.ops import sequence_parallel as sp_ops
 
 
 @pytest.fixture
@@ -20,6 +22,53 @@ def single_rank_tp(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
     )
+
+
+@pytest.mark.parametrize("shape", [(2, 8), (2, 4, 8), (15, 4, 8), (16, 4, 8)])
+@pytest.mark.parametrize("tp_rank", range(8))
+def test_sequence_parallel_chunk_pads_token_dimension(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    tp_rank: int,
+) -> None:
+    tp_size = 8
+    monkeypatch.setattr(
+        model_utils, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        model_utils, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+
+    x = torch.arange(torch.tensor(shape).prod().item()).reshape(shape)
+    result = model_utils.sequence_parallel_chunk_impl(x)
+
+    tokens_per_rank = (shape[0] + tp_size - 1) // tp_size
+    padded = torch.cat(
+        (x, x.new_zeros((tokens_per_rank * tp_size - shape[0], *shape[1:]))),
+        dim=0,
+    )
+    expected = padded.narrow(0, tp_rank * tokens_per_rank, tokens_per_rank)
+
+    assert result.shape == (tokens_per_rank, *shape[1:])
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize("tp_rank", range(8))
+def test_sequence_parallel_padding_mask_tracks_added_token_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_rank: int,
+) -> None:
+    monkeypatch.setattr(
+        sp_ops, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: tp_rank)
+
+    hidden_states = torch.empty(2, 4, 8)
+    is_padding = torch.zeros(2, dtype=torch.bool)
+    result = sp_ops.sp_padding_mask(is_padding, hidden_states)
+
+    assert result.shape == (1,)
+    assert result.item() is (tp_rank >= 2)
 
 
 @pytest.mark.parametrize("prefer_copy", [False, True])

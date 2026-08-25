@@ -9,6 +9,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -18,7 +19,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.distributed.communication_op import tensor_model_parallel_reduce_scatter
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -62,6 +63,7 @@ from vllm.model_executor.models.utils import (
     sequence_parallel_chunk,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.common.ops.sequence_parallel import sp_padding_mask
 from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -1043,6 +1045,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Keep the MHC residual streams sharded over the token dimension for
         # the full decoder stack. The model runner pads token counts to TP size.
         if residual is None:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, x
+                )
             x = sequence_parallel_chunk(x)
             residual = x
             x, post_mix, res_mix = self.hc_pre(

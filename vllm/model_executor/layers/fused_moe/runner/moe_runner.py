@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,6 +52,27 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _all_gather_padding_mask(enabled: bool):
+    if not enabled or not is_forward_context_available():
+        yield
+        return
+
+    forward_context = get_forward_context()
+    local_is_padding = forward_context.is_padding
+    if local_is_padding is None:
+        yield
+        return
+
+    from vllm.distributed import get_tp_group
+
+    forward_context.is_padding = get_tp_group().all_gather(local_is_padding, dim=0)
+    try:
+        yield
+    finally:
+        forward_context.is_padding = local_is_padding
 
 
 def register_layer_for_moe_forward_op(
@@ -993,7 +1014,10 @@ class MoERunner(MoERunnerInterface):
             if input_ids is not None:
                 input_ids = get_tp_group().all_gather(input_ids, dim=0)
 
-        with self._sequence_parallel_context():
+        with (
+            self._sequence_parallel_context(),
+            _all_gather_padding_mask(below_threshold_eager_sp),
+        ):
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
